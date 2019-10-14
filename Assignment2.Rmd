@@ -1,0 +1,346 @@
+---
+title: "Assignment2"
+author: "JAMES ZHANG"
+date: "21/08/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+
+```
+
+### Reading data
+```{r include = FALSE}
+library(tidyverse)
+library(leaps)
+library(lubridate)
+raw_df <- read_csv("week2.csv")
+week4_df <- read_csv("week4.csv")
+
+```
+#Training
+### Cleaning data
+```{r}
+df <- raw_df %>% select(-store_and_fwd_flag, -RatecodeID, -mta_tax, -total_amount, -improvement_surcharge)
+df %>%  summary()
+
+```
+
+```{r}
+#remove no or negative passengers
+df <- df %>% filter(.$passenger_count > 0)
+
+# removed 0 distance because for most lat long changes but have 0 distance and money is charged hence, can conclude that it's invalid data
+df <- df %>% filter(.$trip_distance > 0)
+
+#filtering pickup
+df <- df %>% filter(.$pickup_latitude >  40.577 & .$pickup_latitude < 40.918)
+df <- df %>% filter(.$pickup_longitude > -74.15 & .$pickup_longitude < -73.700)
+
+df <- df %>% filter(.$dropoff_latitude>  40.577 & .$dropoff_latitude < 40.918)
+df <- df  %>% filter(.$dropoff_longitude> -74.15 & .$dropoff_longitude < -73.700)
+
+df%>% summary()
+
+
+```
+
+
+```{r cache=TRUE}
+
+df %>% ggplot(aes(x=factor(hour(tpep_pickup_datetime)))) +
+  geom_bar()
+
+```
+
+```{r}
+# Adding dow and payment type into table
+taxi <- df %>% 
+  mutate(dropoff_datetime = tpep_dropoff_datetime,
+         pickup_datetime = tpep_pickup_datetime,
+         dow = wday(pickup_datetime,label=TRUE,abbr=TRUE, week_start = 1),                           
+         hour_trip_start = factor(hour(pickup_datetime)),                                   
+         trip_duration = as.numeric(difftime(dropoff_datetime,pickup_datetime,units="mins")),    
+         payment_type_label = fct_recode(factor(payment_type), 
+                                         "Credit Card"="1",
+                                         "Cash"="2",
+                                         "No Charge"="3",
+                                         "Other"="4"))
+
+# remove every other payment as only creditcard is recorded
+taxi <- taxi %>% filter(payment_type_label == "Credit Card" )
+
+```
+
+
+## Modifying Trip Durations
+```{r cache=TRUE}
+
+# make sure trip durations are sensible
+taxi %>% ggplot(aes(trip_duration)) + geom_histogram()
+
+# clearly some serious outliers but only a few
+taxi %>% filter(trip_duration < 120) %>% ggplot(aes(trip_duration)) + geom_histogram()
+
+# get rid of outliers
+taxi <- taxi %>%  filter(trip_duration > 0 & trip_duration < 120)
+
+
+# is there a pattern to duration across the week?
+taxi %>% sample_n(5e4) %>% 
+  ggplot(aes(x = dow, y = trip_duration)) + geom_jitter()
+
+taxi %>%
+  group_by(dow) %>%
+  summarize(med = median(trip_duration)) %>%
+  ggplot(aes(x=dow,y=med)) +  geom_point() + 
+  geom_line(aes(group=1),linetype='dotted')
+
+# try the same by time of day
+taxi %>%
+  group_by(hour_trip_start) %>%
+  summarize(med_duration = median(trip_duration)) %>%
+  ggplot(aes(x=hour_trip_start,y=med_duration)) +  geom_point() + 
+  geom_line(aes(group=1),linetype='dotted')
+
+taxi %>%
+  group_by(dow,hour_trip_start) %>%
+  summarize(med_duration = median(trip_duration)) %>%
+  ggplot(aes(x=hour_trip_start,y=med_duration)) +  geom_point() + 
+  facet_wrap(~dow) +geom_line(aes(group=1),linetype='dotted')
+```
+
+## The fare amount
+There was a spike at 50~ for the fare amount. This was investivated however, it was found that many of these high fairs were trips to/from the airport with lat long ~(-73.78215, 40.64460). Hence, this data was not cleaned out as it may be an "airport fare".
+
+```{r cache=TRUE}
+
+taxi %>%
+  ggplot(aes(x=fare_amount)) + geom_histogram(breaks = seq(0:100)-.5) + xlim(0,100)
+
+
+
+taxi %>%
+  filter(fare_amount < 100, fare_amount > 0) %>%
+  group_by(hour_trip_start) %>%
+  summarize(mean_fare=mean(fare_amount)) %>%
+  ggplot(aes(x=hour_trip_start,y=mean_fare)) +geom_point()+geom_line(aes(group=1))
+
+
+d <- taxi %>% filter(fare_amount>50)
+head(d)
+```
+
+## Location clustering
+Using the Kmeans algorithm to cluster location based on latitude and longitude.
+
+```{r cache=TRUE}
+set.seed(2019-08-20)
+# clustering points into areas based
+pickup_clusters <- kmeans(taxi[,6:7], 10)
+taxi$pickup_area<- as.factor(pickup_clusters$cluster)
+
+dropoff_clusters <- kmeans(taxi[,10:11], 10)
+taxi$dropoff_area<- as.factor(dropoff_clusters$cluster)
+
+
+library(leaflet)
+# take a small subset so we can plot quickly
+sm_taxi <- taxi %>% sample_n(500)
+
+# plot on a map
+leaflet(sm_taxi) %>% 
+  addTiles() %>% 
+  addCircleMarkers(~pickup_longitude,~pickup_latitude, radius=2,stroke = FALSE, opacity=1, fillOpacity =1)
+
+leaflet(sm_taxi) %>% 
+  addTiles() %>% 
+  addCircleMarkers(~dropoff_longitude,~dropoff_latitude, radius=2,stroke = FALSE, opacity=1, fillOpacity =1)
+
+
+```
+
+
+
+## Function definitions
+
+```{r}
+yhat<-function(xtrain, ytrain, xtest,p, nvmax){
+  search<-regsubsets(xtrain,ytrain, nvmax, method="back")
+  summ<-summary(search)
+  betahat<-coef(search, p) #coefficients for the best p-variable model
+  xinmodel<-cbind(1,xtest)[,summ$which[p,]] #predictors in that model
+  yhat<-xinmodel%*%betahat
+}
+
+allyhat<-function(xtrain, ytrain, xtest,lambdas,nvmax){
+  yhat<-matrix(nrow=nrow(xtest),ncol=length(lambdas), nvmax)
+  search<-regsubsets(xtrain,ytrain, nvmax=nvmax, method="back")
+  summ<-summary(search)
+
+
+  for(i in 1:length(lambdas)){
+    penMSE<- nrow(xtrain)*log(summ$rss)+lambdas[i]*(1:nvmax)
+    best<-which.min(penMSE) #lowest AIC
+    betahat<-coef(search, best) #coefficients
+    xinmodel<-cbind(1,xtest)[,summ$which[best,]] #predictors in that model
+    yhat[,i]<-xinmodel%*%betahat
+    }
+  yhat
+}
+```
+
+## Preprocessing of data remove unessescary columns
+```{r}
+set.seed(2019-8-20)
+#removing linear dependencies
+ft_taxi <- taxi[,-(1:3)]
+ft_taxi <- ft_taxi[,-(12:13)]
+ft_taxi <- ft_taxi[,-(3:6)]
+ft_taxi <- ft_taxi[,-(3)]
+ft_taxi <- ft_taxi[,-(10)]
+
+```
+
+
+## Lambdas
+```{r}
+
+mf<-model.frame(tip_amount~., data=ft_taxi)
+X<-model.matrix(tip_amount~., mf)[,-1]
+y <- ft_taxi$tip_amount
+
+n<-nrow(X)
+folds<-sample(rep(1:10,length.out=n))
+lambdas<-c(2,4,6,8,10,12,50,100,200,500,1000,10000)
+fitted<-matrix(nrow=n,ncol=length(lambdas))
+for(k in 1:10){
+  train<- (1:n)[folds!=k]
+  test<-(1:n)[folds==k]
+  fitted[test,]<-allyhat(X[train,],y[train],X[test,],lambdas,50)  
+}
+
+colMeans((y-fitted)^2)
+
+```
+## Fitting model
+```{r}
+actual_tips = ft_taxi$tip_amount
+
+search = regsubsets(X, y, nvmax = 50, method = "backward")
+summ = summary(search)
+aic = 2588017*log(summ$rss)+2*(1:50)
+best = which.min(aic)
+betahat = coef(search, best)
+betahat
+```
+
+```{r}
+
+Xpred = cbind(1, X)[,summ$which[best,]]
+fitted = Xpred%*%betahat
+MSPEsample = sum((actual_tips - fitted)^2) / length(fitted)
+MSPEsample
+```
+# Testing
+```{r include=FALSE}
+
+
+df4 <- week4_df %>% select(-store_and_fwd_flag, -RatecodeID, -mta_tax, -total_amount, -improvement_surcharge)
+df4 <- df4 %>% filter(.$passenger_count > 0)
+
+# removed 0 distance because for most lat long changes but have 0 distance and money is charged hence, can conclude that it's invalid data
+df4 <- df4 %>% filter(.$trip_distance > 0)
+
+#filtering pickup
+df4 <- df4 %>% filter(.$pickup_latitude >  40.577 & .$pickup_latitude < 40.918)
+df4 <- df4 %>% filter(.$pickup_longitude > -74.15 & .$pickup_longitude < -73.700)
+
+df4 <- df4 %>% filter(.$dropoff_latitude>  40.577 & .$dropoff_latitude < 40.918)
+df4 <- df4  %>% filter(.$dropoff_longitude> -74.15 & .$dropoff_longitude < -73.700)
+
+
+# Adding dow and payment type into table
+taxi4 <- df4 %>% 
+  mutate(dropoff_datetime = tpep_dropoff_datetime,
+         pickup_datetime = tpep_pickup_datetime,
+         dow = wday(pickup_datetime,label=TRUE,abbr=TRUE, week_start = 1),                           
+         hour_trip_start = factor(hour(pickup_datetime)),                                   
+         trip_duration = as.numeric(difftime(dropoff_datetime,pickup_datetime,units="mins")),    
+         payment_type_label = fct_recode(factor(payment_type), 
+                                         "Credit Card"="1",
+                                         "Cash"="2",
+                                         "No Charge"="3",
+                                         "Other"="4"))
+
+# remove every other payment as only creditcard is recorded
+taxi4 <- taxi4 %>% filter(payment_type_label == "Credit Card" )
+# get rid of outliers
+taxi4 <- taxi4 %>%  filter(trip_duration > 0 & trip_duration < 120)
+taxi4 <- taxi4 %>%  filter(trip_distance > 0 & trip_distance < 120)
+
+
+
+set.seed(2019-08-20)
+# clustering points into areas based
+pickup_clusters4 <- kmeans(taxi4[,6:7], 10)
+taxi4$pickup_area<- as.factor(pickup_clusters4$cluster)
+
+dropoff_clusters4 <- kmeans(taxi4[,10:11], 10)
+taxi4$dropoff_area<- as.factor(dropoff_clusters4$cluster)
+
+set.seed(2019-8-20)
+#removing linear dependencies
+ft_taxi4 <- taxi4[,-(1:3)]
+ft_taxi4 <- ft_taxi4[,-(12:13)]
+ft_taxi4 <- ft_taxi4[,-(3:6)]
+ft_taxi4 <- ft_taxi4[,-(3)]
+ft_taxi4 <- ft_taxi4[,-(10)]
+
+#use model on week4 data
+y_test <- ft_taxi4$tip_amount
+mf4<-model.frame(tip_amount~., data=ft_taxi4)
+X4<-model.matrix(tip_amount~., mf4)[,-1]
+X_final<-cbind(1, X4[, names(betahat[-1])])
+
+fitted1 = X_final%*%betahat
+MSPEfull = sum((ft_taxi4$tip_amount - fitted1)^2) / length(fitted1)
+```
+
+```{r}
+MSPEfull
+
+```
+
+```{r}
+summary(ft_taxi)
+summary(ft_taxi4)
+```
+# Report
+
+The goal of this assignment was to construct a model which predicts the tips given in a taxi ride trained on taxi data from NYC. The training data used was from wwek 2 of 2016 and week 6 was used to test the performance of this model. The training of the model was split into 4 main steps:
+1. Data observing/ understanding
+2. Data cleaning/ tidying
+3. Model selection
+4. Training/fitting the model
+## Modle Construction
+#### 1.Data Understanding
+This step involved reading the dictionary and understanding what each column meant and whether the features are relevant for this task. Something that stood out in this step was that the tips recorded was only from creditcard information and not from other forms of payment. Hence, only creditcards were kept(tidied in step 2).
+
+#### 2. Data Cleaning/tidying
+The input data was untidied and had many redundant columns which included store_and_fwd_flag, RatecodeID, mta_tax, total_amount and improvement_surcharge (Identified in the previous step).
+These features were independent of the taxi tip, hence leaving them in would negatively affect the model so they were removed. The next step was to remove noisy data such as incorrect or potentially corrupted values as well as outliers in the data such as latitude and longitude, time taken and time taken etc. Something interesting that appeared was that suspected outlier in fare amount. There was a spike 
+
+It became clear that grouping data was a good idea as there were columns such as `pickup_lat` and `pickup_long`. These two values were clearly related and should not be independent of each other. Hence, the locations were clustered using a unsupervised machine learning algorithm called kmeans. This not only captured the latitude and the logitude, it also classifies the points into areas which also may assist in prediction.
+
+#### 3. Model section
+Some columns which had linear dependencies were removed, such as latitude, logitude information(as they were already captured). The model selected for this task was a multi-variate linear regression model as it did not introduce complexities as well as had low computation time. k fold cross validation was the method used for model selection this estimates the MSPE for a particular model. This technique was then encapsulated in a hyper-parameter turning (where lambda was tuned) to find the best model. Multiple lambda values were experimented with and the one with the lowest MSPE (1.9503) was when lambda was equal to 2.
+#### 4. Training
+The best model from step 3 was then taken and fitted to the entire week 2 dataset. This resulted in an overall MSPE of 1.941.
+
+## Evaluation/Testing
+
+The model from the previous step was taken and fitted to the week 4 data. However, before the model was fitted to the data from week 4 had to be cleaned in the same way as data from week 2 was. After cleaning the trained moddel could then be tested on this data. As expected the MSPE for testing ( 2.45376) was higher compared to the MSPE on week 2's data. This is a very common occurance as data collected from different periods are likely to have a different distributions. After implementation it was realised that there could be slight issues with the kmeans algorithm in this context (different starting points leads to different clusters etc), however due to the limitation of time; this was not investigated. The model seems to be fairly innaccurate and not suitable for prediction, however, it can provide an estimate for tips. Methods to imrpove the mode's performance could be to increase the data set, perform over/under sampling or trying an alternative model.
+
